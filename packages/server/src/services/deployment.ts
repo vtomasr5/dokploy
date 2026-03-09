@@ -23,7 +23,7 @@ import {
 } from "@dokploy/server/utils/process/execAsync";
 import { TRPCError } from "@trpc/server";
 import { format } from "date-fns";
-import { desc, eq, and, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { z } from "zod";
 import {
 	type Application,
@@ -515,7 +515,13 @@ export const createDeploymentVolumeBackup = async (
 	const volumeBackup = await findVolumeBackupById(deployment.volumeBackupId);
 
 	const serverId =
-		volumeBackup.application?.serverId || volumeBackup.compose?.serverId;
+		volumeBackup.application?.serverId ||
+		volumeBackup.compose?.serverId ||
+		volumeBackup.postgres?.serverId ||
+		volumeBackup.mysql?.serverId ||
+		volumeBackup.mariadb?.serverId ||
+		volumeBackup.mongo?.serverId ||
+		volumeBackup.redis?.serverId;
 	await removeLastTenDeployments(
 		deployment.volumeBackupId,
 		"volumeBackup",

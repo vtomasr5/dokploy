@@ -7,7 +7,15 @@ import {
 import { findEnvironmentById } from "@dokploy/server/services/environment";
 import { findProjectById } from "@dokploy/server/services/project";
 import { sendDatabaseBackupNotifications } from "../notifications/database-backup";
-import { execAsync, execAsyncRemote } from "../process/execAsync";
+import {
+	type CommandExecutionTarget,
+	execAsyncOnTarget,
+} from "../process/execAsync";
+import {
+	prepareDeploymentLogOnTarget,
+	syncDeploymentLogFromTarget,
+} from "../swarm/deployment-log";
+import { resolveSwarmServiceExecutionTarget } from "../swarm/service-target";
 import { getBackupCommand, getS3Credentials, normalizeS3Path } from "./utils";
 
 export const runComposeBackup = async (
@@ -27,22 +35,78 @@ export const runComposeBackup = async (
 		title: "Compose Backup",
 		description: "Compose Backup",
 	});
+	const managerTarget: CommandExecutionTarget = compose.serverId
+		? {
+				type: "server",
+				serverId: compose.serverId,
+			}
+		: {
+				type: "local",
+			};
+	let swarmTarget: Awaited<
+		ReturnType<typeof resolveSwarmServiceExecutionTarget>
+	> | null = null;
 
 	try {
 		const rcloneFlags = getS3Credentials(destination);
 		const rcloneDestination = `:s3:${destination.bucket}/${bucketDestination}`;
 		const rcloneCommand = `rclone rcat ${rcloneFlags.join(" ")} "${rcloneDestination}"`;
 
+		if (compose.composeType === "stack" && !serviceName) {
+			throw new Error("Compose stack backups require a service name.");
+		}
+
+		swarmTarget =
+			compose.composeType === "stack"
+				? await resolveSwarmServiceExecutionTarget(
+						`${compose.appName}_${serviceName}`,
+						compose.serverId,
+						project.organizationId,
+					)
+				: null;
+
+		if (swarmTarget) {
+			await prepareDeploymentLogOnTarget({
+				deploymentId: deployment.deploymentId,
+				logPath: deployment.logPath,
+				target: swarmTarget.target,
+				serverId: swarmTarget.serverId,
+			});
+		}
+
 		const backupCommand = getBackupCommand(
 			backup,
 			rcloneCommand,
 			deployment.logPath,
+			swarmTarget
+				? {
+						containerId: swarmTarget.containerId,
+					}
+				: undefined,
 		);
-		if (compose.serverId) {
-			await execAsyncRemote(compose.serverId, backupCommand);
-		} else {
-			await execAsync(backupCommand, {
+		const executionTarget: CommandExecutionTarget = swarmTarget
+			? swarmTarget.target
+			: compose.serverId
+				? {
+						type: "server",
+						serverId: compose.serverId,
+					}
+				: {
+						type: "local",
+					};
+
+		await execAsyncOnTarget(executionTarget, backupCommand, {
+			localOptions: {
 				shell: "/bin/bash",
+			},
+		});
+
+		if (swarmTarget?.target.type === "ssh" && !swarmTarget.serverId) {
+			await syncDeploymentLogFromTarget({
+				sourceLogPath: deployment.logPath,
+				sourceTarget: swarmTarget.target,
+				destinationLogPath: deployment.logPath,
+				destinationTarget: managerTarget,
 			});
 		}
 
@@ -57,6 +121,15 @@ export const runComposeBackup = async (
 
 		await updateDeploymentStatus(deployment.deploymentId, "done");
 	} catch (error) {
+		if (swarmTarget?.target.type === "ssh" && !swarmTarget.serverId) {
+			await syncDeploymentLogFromTarget({
+				sourceLogPath: deployment.logPath,
+				sourceTarget: swarmTarget.target,
+				destinationLogPath: deployment.logPath,
+				destinationTarget: managerTarget,
+			}).catch(() => undefined);
+		}
+
 		console.log(error);
 		await sendDatabaseBackupNotifications({
 			applicationName: name,

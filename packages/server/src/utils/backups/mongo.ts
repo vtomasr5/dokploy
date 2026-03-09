@@ -7,7 +7,15 @@ import { findEnvironmentById } from "@dokploy/server/services/environment";
 import type { Mongo } from "@dokploy/server/services/mongo";
 import { findProjectById } from "@dokploy/server/services/project";
 import { sendDatabaseBackupNotifications } from "../notifications/database-backup";
-import { execAsync, execAsyncRemote } from "../process/execAsync";
+import {
+	type CommandExecutionTarget,
+	execAsyncOnTarget,
+} from "../process/execAsync";
+import {
+	prepareDeploymentLogOnTarget,
+	syncDeploymentLogFromTarget,
+} from "../swarm/deployment-log";
+import { resolveSwarmServiceExecutionTarget } from "../swarm/service-target";
 import { getBackupCommand, getS3Credentials, normalizeS3Path } from "./utils";
 
 export const runMongoBackup = async (mongo: Mongo, backup: BackupSchedule) => {
@@ -23,22 +31,55 @@ export const runMongoBackup = async (mongo: Mongo, backup: BackupSchedule) => {
 		title: "MongoDB Backup",
 		description: "MongoDB Backup",
 	});
+	const managerTarget: CommandExecutionTarget = mongo.serverId
+		? {
+				type: "server",
+				serverId: mongo.serverId,
+			}
+		: {
+				type: "local",
+			};
+	let target: Awaited<
+		ReturnType<typeof resolveSwarmServiceExecutionTarget>
+	> | null = null;
 	try {
 		const rcloneFlags = getS3Credentials(destination);
 		const rcloneDestination = `:s3:${destination.bucket}/${bucketDestination}`;
 		const rcloneCommand = `rclone rcat ${rcloneFlags.join(" ")} "${rcloneDestination}"`;
+		target = await resolveSwarmServiceExecutionTarget(
+			mongo.appName,
+			mongo.serverId,
+			project.organizationId,
+		);
+
+		await prepareDeploymentLogOnTarget({
+			deploymentId: deployment.deploymentId,
+			logPath: deployment.logPath,
+			target: target.target,
+			serverId: target.serverId,
+		});
 
 		const backupCommand = getBackupCommand(
 			backup,
 			rcloneCommand,
 			deployment.logPath,
+			{
+				containerId: target.containerId,
+			},
 		);
 
-		if (mongo.serverId) {
-			await execAsyncRemote(mongo.serverId, backupCommand);
-		} else {
-			await execAsync(backupCommand, {
+		await execAsyncOnTarget(target.target, backupCommand, {
+			localOptions: {
 				shell: "/bin/bash",
+			},
+		});
+
+		if (target.target.type === "ssh" && !target.serverId) {
+			await syncDeploymentLogFromTarget({
+				sourceLogPath: deployment.logPath,
+				sourceTarget: target.target,
+				destinationLogPath: deployment.logPath,
+				destinationTarget: managerTarget,
 			});
 		}
 
@@ -52,6 +93,15 @@ export const runMongoBackup = async (mongo: Mongo, backup: BackupSchedule) => {
 		});
 		await updateDeploymentStatus(deployment.deploymentId, "done");
 	} catch (error) {
+		if (target?.target.type === "ssh" && !target.serverId) {
+			await syncDeploymentLogFromTarget({
+				sourceLogPath: deployment.logPath,
+				sourceTarget: target.target,
+				destinationLogPath: deployment.logPath,
+				destinationTarget: managerTarget,
+			}).catch(() => undefined);
+		}
+
 		console.log(error);
 		await sendDatabaseBackupNotifications({
 			applicationName: name,

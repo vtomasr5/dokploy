@@ -220,13 +220,18 @@ export const getBackupCommand = (
 	backup: BackupSchedule,
 	rcloneCommand: string,
 	logPath: string,
+	options?: {
+		containerId?: string;
+	},
 ) => {
 	const containerSearch = getContainerSearchCommand(backup);
 	const backupCommand = generateBackupCommand(backup);
+	const containerId = options?.containerId;
 
 	logger.info(
 		{
 			containerSearch,
+			containerId,
 			backupCommand,
 			rcloneCommand,
 			logPath,
@@ -238,7 +243,11 @@ export const getBackupCommand = (
 	set -eo pipefail;
 	echo "[$(date)] Starting backup process..." >> ${logPath};
 	echo "[$(date)] Executing backup command..." >> ${logPath};
-	CONTAINER_ID=$(${containerSearch})
+	${
+		containerId
+			? `CONTAINER_ID="${containerId}"`
+			: `CONTAINER_ID=$(${containerSearch})`
+	}
 
 	if [ -z "$CONTAINER_ID" ]; then
 		echo "[$(date)] ❌ Error: Container not found" >> ${logPath};

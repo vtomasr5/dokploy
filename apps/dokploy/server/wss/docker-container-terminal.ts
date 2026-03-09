@@ -1,5 +1,10 @@
 import type http from "node:http";
-import { findServerById, IS_CLOUD, validateRequest } from "@dokploy/server";
+import {
+	findServerById,
+	IS_CLOUD,
+	resolveSwarmTaskExecutionTarget,
+	validateRequest,
+} from "@dokploy/server";
 import { spawn } from "node-pty";
 import { Client } from "ssh2";
 import { WebSocketServer } from "ws";
@@ -32,6 +37,8 @@ export const setupDockerContainerTerminalWebSocketServer = (
 		const containerId = url.searchParams.get("containerId");
 		const activeWay = url.searchParams.get("activeWay");
 		const serverId = url.searchParams.get("serverId");
+		const runType =
+			url.searchParams.get("runType") === "swarm" ? "swarm" : "native";
 		const { user, session } = await validateRequest(req);
 
 		if (!containerId) {
@@ -59,24 +66,101 @@ export const setupDockerContainerTerminalWebSocketServer = (
 			return;
 		}
 		try {
-			if (serverId) {
-				const server = await findServerById(serverId);
-				if (!server.sshKeyId)
-					throw new Error("No SSH key available for this server");
+			const activeOrganizationId =
+				"activeOrganizationId" in session ? session.activeOrganizationId : null;
 
+			if (serverId) {
+				const requestedServer = await findServerById(serverId);
+				if (
+					!activeOrganizationId ||
+					requestedServer.organizationId !== activeOrganizationId
+				) {
+					ws.close(4000, "Unauthorized server access");
+					return;
+				}
+			}
+
+			let resolvedContainerId = containerId;
+			let targetConnection:
+				| {
+						type: "local";
+				  }
+				| {
+						type: "remote";
+						host: string;
+						port: number;
+						username: string;
+						privateKey: string;
+				  } = {
+				type: "local",
+			};
+
+			if (runType === "swarm") {
+				const resolvedTarget = await resolveSwarmTaskExecutionTarget(
+					containerId,
+					serverId,
+					activeOrganizationId || undefined,
+				);
+				resolvedContainerId = resolvedTarget.containerId;
+
+				if (resolvedTarget.target.type === "server") {
+					const server = await findServerById(resolvedTarget.target.serverId);
+					if (
+						!activeOrganizationId ||
+						server.organizationId !== activeOrganizationId
+					) {
+						ws.close(4000, "Unauthorized swarm node access");
+						return;
+					}
+
+					if (!server.sshKeyId) {
+						throw new Error("No SSH key available for this server");
+					}
+
+					targetConnection = {
+						type: "remote",
+						host: server.ipAddress,
+						port: server.port,
+						username: server.username,
+						privateKey: server.sshKey?.privateKey || "",
+					};
+				} else if (resolvedTarget.target.type === "ssh") {
+					targetConnection = {
+						type: "remote",
+						host: resolvedTarget.target.connection.host,
+						port: resolvedTarget.target.connection.port,
+						username: resolvedTarget.target.connection.username,
+						privateKey: resolvedTarget.target.connection.privateKey,
+					};
+				}
+			} else if (serverId) {
+				const server = await findServerById(serverId);
+				if (!server.sshKeyId) {
+					throw new Error("No SSH key available for this server");
+				}
+
+				targetConnection = {
+					type: "remote",
+					host: server.ipAddress,
+					port: server.port,
+					username: server.username,
+					privateKey: server.sshKey?.privateKey || "",
+				};
+			}
+
+			if (targetConnection.type === "remote") {
 				const conn = new Client();
 				let _stdout = "";
 				let _stderr = "";
 				conn
 					.once("ready", () => {
-						// Use array-style arguments to prevent shell injection
 						const dockerCommand = [
 							"docker",
 							"exec",
 							"-it",
 							"-w",
 							"/",
-							containerId,
+							resolvedContainerId,
 							shell,
 						].join(" ");
 						conn.exec(dockerCommand, { pty: true }, (err, stream) => {
@@ -120,7 +204,6 @@ export const setupDockerContainerTerminalWebSocketServer = (
 
 							ws.on("close", () => {
 								stream.end();
-								// Ensure SSH connection is closed when WebSocket closes
 								conn.end();
 							});
 						});
@@ -134,10 +217,10 @@ export const setupDockerContainerTerminalWebSocketServer = (
 						conn.end();
 					})
 					.connect({
-						host: server.ipAddress,
-						port: server.port,
-						username: server.username,
-						privateKey: server.sshKey?.privateKey,
+						host: targetConnection.host,
+						port: targetConnection.port,
+						username: targetConnection.username,
+						privateKey: targetConnection.privateKey,
 					});
 			} else {
 				if (IS_CLOUD) {
@@ -147,7 +230,7 @@ export const setupDockerContainerTerminalWebSocketServer = (
 				}
 				const ptyProcess = spawn(
 					"docker",
-					["exec", "-it", "-w", "/", containerId, shell],
+					["exec", "-it", "-w", "/", resolvedContainerId, shell],
 					{},
 				);
 

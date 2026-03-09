@@ -3,7 +3,8 @@ import type { Destination } from "@dokploy/server/services/destination";
 import type { MySql } from "@dokploy/server/services/mysql";
 import type { z } from "zod";
 import { getS3Credentials } from "../backups/utils";
-import { execAsync, execAsyncRemote } from "../process/execAsync";
+import { execAsyncOnTarget } from "../process/execAsync";
+import { resolveSwarmServiceExecutionTarget } from "../swarm/service-target";
 import { getRestoreCommand } from "./utils";
 
 export const restoreMySqlBackup = async (
@@ -20,6 +21,7 @@ export const restoreMySqlBackup = async (
 		const backupPath = `${bucketPath}/${backupInput.backupFile}`;
 
 		const rcloneCommand = `rclone cat ${rcloneFlags.join(" ")} "${backupPath}" | gunzip`;
+		const target = await resolveSwarmServiceExecutionTarget(appName, serverId);
 
 		const command = getRestoreCommand({
 			appName,
@@ -30,17 +32,18 @@ export const restoreMySqlBackup = async (
 			},
 			restoreType: "database",
 			rcloneCommand,
+			containerId: target.containerId,
 		});
 
 		emit("Starting restore...");
 
 		emit(`Executing command: ${command}`);
 
-		if (serverId) {
-			await execAsyncRemote(serverId, command);
-		} else {
-			await execAsync(command);
-		}
+		await execAsyncOnTarget(target.target, command, {
+			localOptions: {
+				shell: "/bin/bash",
+			},
+		});
 
 		emit("Restore completed successfully!");
 	} catch (error) {

@@ -9,6 +9,26 @@ export { ExecError } from "./ExecError";
 
 const execAsyncBase = util.promisify(exec);
 
+export interface SshConnectionConfig {
+	host: string;
+	port: number;
+	username: string;
+	privateKey: string;
+}
+
+export type CommandExecutionTarget =
+	| {
+			type: "local";
+	  }
+	| {
+			type: "server";
+			serverId: string;
+	  }
+	| {
+			type: "ssh";
+			connection: SshConnectionConfig;
+	  };
+
 export const execAsync = async (
 	command: string,
 	options?: { cwd?: string; env?: NodeJS.ProcessEnv; shell?: string },
@@ -148,6 +168,29 @@ export const execAsyncRemote = async (
 	const server = await findServerById(serverId);
 	if (!server.sshKeyId) throw new Error("No SSH key available for this server");
 
+	return execAsyncRemoteWithConnection(
+		{
+			host: server.ipAddress,
+			port: server.port,
+			username: server.username,
+			privateKey: server.sshKey?.privateKey || "",
+		},
+		command,
+		onData,
+		serverId,
+	);
+};
+
+export const execAsyncRemoteWithConnection = async (
+	connection: SshConnectionConfig,
+	command: string,
+	onData?: (data: string) => void,
+	serverId?: string,
+): Promise<{ stdout: string; stderr: string }> => {
+	if (!connection.privateKey) {
+		throw new Error("No SSH key available for this server");
+	}
+
 	let stdout = "";
 	let stderr = "";
 	return new Promise((resolve, reject) => {
@@ -240,13 +283,58 @@ export const execAsyncRemote = async (
 				}
 			})
 			.connect({
-				host: server.ipAddress,
-				port: server.port,
-				username: server.username,
-				privateKey: server.sshKey?.privateKey,
+				host: connection.host,
+				port: connection.port,
+				username: connection.username,
+				privateKey: connection.privateKey,
 				timeout: 99999,
 			});
 	});
+};
+
+interface TargetExecOptions {
+	onData?: (data: string) => void;
+	localOptions?: { cwd?: string; env?: NodeJS.ProcessEnv; shell?: string };
+}
+
+export const execAsyncOnTarget = async (
+	target: CommandExecutionTarget,
+	command: string,
+	options: TargetExecOptions = {},
+): Promise<{ stdout: string; stderr: string }> => {
+	if (target.type === "local") {
+		return execAsync(command, options.localOptions);
+	}
+
+	if (target.type === "server") {
+		return execAsyncRemote(target.serverId, command, options.onData);
+	}
+
+	return execAsyncRemoteWithConnection(
+		target.connection,
+		command,
+		options.onData,
+	);
+};
+
+export const execAsyncStreamOnTarget = async (
+	target: CommandExecutionTarget,
+	command: string,
+	options: TargetExecOptions = {},
+): Promise<{ stdout: string; stderr: string }> => {
+	if (target.type === "local") {
+		return execAsyncStream(command, options.onData, options.localOptions);
+	}
+
+	if (target.type === "server") {
+		return execAsyncRemote(target.serverId, command, options.onData);
+	}
+
+	return execAsyncRemoteWithConnection(
+		target.connection,
+		command,
+		options.onData,
+	);
 };
 
 export const sleep = (ms: number) => {

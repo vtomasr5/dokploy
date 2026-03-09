@@ -3,7 +3,11 @@ import type { Compose } from "@dokploy/server/services/compose";
 import type { Destination } from "@dokploy/server/services/destination";
 import type { z } from "zod";
 import { getS3Credentials } from "../backups/utils";
-import { execAsync, execAsyncRemote } from "../process/execAsync";
+import {
+	type CommandExecutionTarget,
+	execAsyncOnTarget,
+} from "../process/execAsync";
+import { resolveSwarmServiceExecutionTarget } from "../swarm/service-target";
 import { getRestoreCommand } from "./utils";
 
 interface DatabaseCredentials {
@@ -27,6 +31,18 @@ export const restoreComposeBackup = async (
 		const bucketPath = `:s3:${destination.bucket}`;
 		const backupPath = `${bucketPath}/${backupInput.backupFile}`;
 		let rcloneCommand = `rclone cat ${rcloneFlags.join(" ")} "${backupPath}" | gunzip`;
+
+		if (composeType === "stack" && !backupInput.metadata?.serviceName) {
+			throw new Error("Compose stack restores require a service name.");
+		}
+
+		const swarmTarget =
+			composeType === "stack" && backupInput.metadata?.serviceName
+				? await resolveSwarmServiceExecutionTarget(
+						`${appName}_${backupInput.metadata.serviceName}`,
+						serverId,
+					)
+				: null;
 
 		if (backupInput.metadata?.mongo) {
 			rcloneCommand = `rclone copy ${rcloneFlags.join(" ")} "${backupPath}"`;
@@ -70,18 +86,29 @@ export const restoreComposeBackup = async (
 			restoreType: composeType,
 			rcloneCommand,
 			backupFile: backupInput.backupFile,
+			containerId: swarmTarget?.containerId,
 		});
+		const executionTarget: CommandExecutionTarget = swarmTarget
+			? swarmTarget.target
+			: serverId
+				? {
+						type: "server",
+						serverId,
+					}
+				: {
+						type: "local",
+					};
 
 		emit("Starting restore...");
 		emit(`Backup path: ${backupPath}`);
 
 		emit(`Executing command: ${restoreCommand}`);
 
-		if (serverId) {
-			await execAsyncRemote(serverId, restoreCommand);
-		} else {
-			await execAsync(restoreCommand);
-		}
+		await execAsyncOnTarget(executionTarget, restoreCommand, {
+			localOptions: {
+				shell: "/bin/bash",
+			},
+		});
 
 		emit("Restore completed successfully!");
 	} catch (error) {

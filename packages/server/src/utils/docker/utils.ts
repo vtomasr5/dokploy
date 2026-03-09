@@ -12,9 +12,14 @@ import type { MongoNested } from "../databases/mongo";
 import type { MysqlNested } from "../databases/mysql";
 import type { PostgresNested } from "../databases/postgres";
 import type { RedisNested } from "../databases/redis";
-import { execAsync, execAsyncRemote } from "../process/execAsync";
+import {
+	execAsync,
+	execAsyncOnTarget,
+	execAsyncRemote,
+} from "../process/execAsync";
 import { spawnAsync } from "../process/spawnAsync";
 import { getRemoteDocker } from "../servers/remote-docker";
+import { resolveSwarmServiceExecutionTarget } from "../swarm/service-target";
 
 interface RegistryAuth {
 	username: string;
@@ -682,22 +687,17 @@ export const getServiceContainer = async (
 	serverId?: string | null,
 ) => {
 	try {
-		const filter = {
-			status: ["running"],
-			label: [`com.docker.swarm.service.name=${appName}`],
-		};
-		const remoteDocker = await getRemoteDocker(serverId);
-		const containers = await remoteDocker.listContainers({
-			filters: JSON.stringify(filter),
-		});
+		const target = await resolveSwarmServiceExecutionTarget(appName, serverId);
+		const { stdout } = await execAsyncOnTarget(
+			target.target,
+			`docker inspect ${target.containerId} --format '{{json .}}'`,
+		);
 
-		if (containers.length === 0 || !containers[0]) {
+		if (!stdout.trim()) {
 			return null;
 		}
 
-		const container = containers[0];
-
-		return container;
+		return JSON.parse(stdout);
 	} catch (error) {
 		throw error;
 	}
@@ -709,17 +709,28 @@ export const getComposeContainer = async (
 ) => {
 	try {
 		const { appName, composeType, serverId } = compose;
+
+		if (composeType === "stack") {
+			const target = await resolveSwarmServiceExecutionTarget(
+				`${appName}_${serviceName}`,
+				serverId,
+			);
+			const { stdout } = await execAsyncOnTarget(
+				target.target,
+				`docker inspect ${target.containerId} --format '{{json .}}'`,
+			);
+
+			if (!stdout.trim()) {
+				return null;
+			}
+
+			return JSON.parse(stdout);
+		}
+
 		// 1. Determine the correct labels based on composeType
 		const labels: string[] = [];
-		if (composeType === "stack") {
-			// Labels for Docker Swarm stack services
-			labels.push(`com.docker.stack.namespace=${appName}`);
-			labels.push(`com.docker.swarm.service.name=${appName}_${serviceName}`);
-		} else {
-			// Labels for Docker Compose projects (default)
-			labels.push(`com.docker.compose.project=${appName}`);
-			labels.push(`com.docker.compose.service=${serviceName}`);
-		}
+		labels.push(`com.docker.compose.project=${appName}`);
+		labels.push(`com.docker.compose.service=${serviceName}`);
 		const filter = {
 			status: ["running"],
 			label: labels,

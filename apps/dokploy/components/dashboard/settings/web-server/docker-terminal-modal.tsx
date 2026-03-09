@@ -48,16 +48,57 @@ export const DockerTerminalModal = ({
 	serverId,
 	appType,
 }: Props) => {
-	const { data, isPending } = api.docker.getContainersByAppNameMatch.useQuery(
-		{
-			appName,
-			appType,
-			serverId,
-		},
-		{
-			enabled: !!appName,
-		},
+	const runType: "native" | "swarm" =
+		appType === "docker-compose" ? "native" : "swarm";
+
+	const { data: nativeContainers, isLoading: isPendingNative } =
+		api.docker.getContainersByAppNameMatch.useQuery(
+			{
+				appName,
+				appType,
+				serverId,
+			},
+			{
+				enabled: !!appName && runType === "native",
+			},
+		);
+
+	const { data: stackContainers, isLoading: isPendingStack } =
+		api.docker.getStackContainersByAppName.useQuery(
+			{
+				appName,
+				serverId,
+			},
+			{
+				enabled: !!appName && runType === "swarm" && appType === "stack",
+			},
+		);
+
+	const { data: serviceContainers, isLoading: isPendingService } =
+		api.docker.getServiceContainersByAppName.useQuery(
+			{
+				appName,
+				serverId,
+			},
+			{
+				enabled: !!appName && runType === "swarm" && appType !== "stack",
+			},
+		);
+
+	const swarmContainers =
+		appType === "stack" ? stackContainers : serviceContainers;
+	const isPendingSwarm =
+		appType === "stack" ? isPendingStack : isPendingService;
+	const runningSwarmContainers = swarmContainers?.filter(
+		(container) => container.state === "running",
 	);
+	const data =
+		runType === "swarm"
+			? runningSwarmContainers && runningSwarmContainers.length > 0
+				? runningSwarmContainers
+				: swarmContainers
+			: nativeContainers;
+	const isPending = runType === "swarm" ? isPendingSwarm : isPendingNative;
 
 	const [containerId, setContainerId] = useState<string | undefined>();
 	const [mainDialogOpen, setMainDialogOpen] = useState(false);
@@ -81,7 +122,7 @@ export const DockerTerminalModal = ({
 	};
 
 	useEffect(() => {
-		if (data && data?.length > 0) {
+		if (data && data.length > 0) {
 			setContainerId(data[0]?.containerId);
 		}
 	}, [data]);
@@ -117,7 +158,11 @@ export const DockerTerminalModal = ({
 									key={container.containerId}
 									value={container.containerId}
 								>
-									{container.name} ({container.containerId}){" "}
+									{container.name} ({container.containerId}
+									{runType === "swarm" && "node" in container
+										? `@${container.node}`
+										: ""}
+									){" "}
 									<Badge variant={badgeStateColor(container.state)}>
 										{container.state}
 									</Badge>
@@ -131,6 +176,7 @@ export const DockerTerminalModal = ({
 					serverId={serverId || ""}
 					id="terminal"
 					containerId={containerId || "select-a-container"}
+					runType={runType}
 				/>
 				<Dialog open={confirmDialogOpen} onOpenChange={setConfirmDialogOpen}>
 					<DialogContent onEscapeKeyDown={(event) => event.preventDefault()}>

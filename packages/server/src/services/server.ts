@@ -5,7 +5,7 @@ import {
 	server,
 } from "@dokploy/server/db/schema";
 import { TRPCError } from "@trpc/server";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { z } from "zod";
 
 export type Server = typeof server.$inferSelect;
@@ -49,6 +49,25 @@ export const findServerById = async (serverId: string) => {
 		});
 	}
 	return currentServer;
+};
+
+export const findServerByIpAddress = async (
+	ipAddress: string,
+	organizationId?: string,
+) => {
+	const currentServer = await db.query.server.findFirst({
+		where: organizationId
+			? and(
+					eq(server.ipAddress, ipAddress),
+					eq(server.organizationId, organizationId),
+				)
+			: eq(server.ipAddress, ipAddress),
+		with: {
+			sshKey: true,
+		},
+	});
+
+	return currentServer ?? null;
 };
 
 export const findServersByUserId = async (userId: string) => {
