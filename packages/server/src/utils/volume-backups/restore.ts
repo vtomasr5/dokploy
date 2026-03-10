@@ -127,6 +127,7 @@ export const restoreVolume = async (
 		const target = await resolveSwarmServiceNodeExecutionTarget(
 			application.appName,
 			application.serverId,
+			application.environment?.project?.organizationId,
 		);
 		const command = buildVolumeRestoreCommand(
 			volumeName,
@@ -151,6 +152,7 @@ export const restoreVolume = async (
 			compose.appName,
 			volumeName,
 			compose.serverId,
+			compose.environment?.project?.organizationId,
 		);
 		const command = buildVolumeRestoreCommand(
 			volumeName,

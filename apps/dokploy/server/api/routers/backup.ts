@@ -221,9 +221,13 @@ export const backupRouter = createTRPCRouter({
 				await keepLatestNBackups(backup, mysql?.serverId);
 				return true;
 			} catch (error) {
+				const message =
+					error instanceof Error
+						? error.message
+						: "Error running manual MySQL backup";
 				throw new TRPCError({
 					code: "BAD_REQUEST",
-					message: "Error running manual MySQL backup ",
+					message,
 					cause: error,
 				});
 			}
@@ -238,9 +242,13 @@ export const backupRouter = createTRPCRouter({
 				await keepLatestNBackups(backup, mariadb?.serverId);
 				return true;
 			} catch (error) {
+				const message =
+					error instanceof Error
+						? error.message
+						: "Error running manual Mariadb backup";
 				throw new TRPCError({
 					code: "BAD_REQUEST",
-					message: "Error running manual Mariadb backup ",
+					message,
 					cause: error,
 				});
 			}
@@ -255,9 +263,13 @@ export const backupRouter = createTRPCRouter({
 				await keepLatestNBackups(backup, compose?.serverId);
 				return true;
 			} catch (error) {
+				const message =
+					error instanceof Error
+						? error.message
+						: "Error running manual Compose backup";
 				throw new TRPCError({
 					code: "BAD_REQUEST",
-					message: "Error running manual Compose backup ",
+					message,
 					cause: error,
 				});
 			}
@@ -272,9 +284,13 @@ export const backupRouter = createTRPCRouter({
 				await keepLatestNBackups(backup, mongo?.serverId);
 				return true;
 			} catch (error) {
+				const message =
+					error instanceof Error
+						? error.message
+						: "Error running manual Mongo backup";
 				throw new TRPCError({
 					code: "BAD_REQUEST",
-					message: "Error running manual Mongo backup ",
+					message,
 					cause: error,
 				});
 			}
