@@ -6,6 +6,8 @@ import {
 	type CommandExecutionTarget,
 	execAsync,
 	execAsyncRemote,
+	execAsyncRemoteWithConnection,
+	type SshConnectionConfig,
 } from "../process/execAsync";
 
 interface SwarmTaskInspect {
@@ -29,6 +31,11 @@ interface SwarmNodeInspect {
 	Status?: {
 		Addr?: string;
 	};
+}
+
+interface SwarmRemoteManager {
+	Addr?: string;
+	NodeID?: string;
 }
 
 interface ResolvedExecutionTarget {
@@ -56,15 +63,249 @@ export interface ResolvedSwarmServiceTarget {
 	serverId: string | null;
 }
 
-const execOnManager = async (
-	managerServerId: string | null | undefined,
+export interface ResolvedSwarmManagerTarget {
+	target: CommandExecutionTarget;
+	serverId: string | null;
+	organizationId?: string;
+	sshFallbackConnection?: SshConnectionConfig;
+}
+
+const execOnTarget = async (
+	target: CommandExecutionTarget,
 	command: string,
 ) => {
-	if (managerServerId) {
-		return execAsyncRemote(managerServerId, command);
+	if (target.type === "local") {
+		return execAsync(command);
 	}
 
-	return execAsync(command);
+	if (target.type === "server") {
+		return execAsyncRemote(target.serverId, command);
+	}
+
+	return execAsyncRemoteWithConnection(target.connection, command);
+};
+
+const execOnManager = async (
+	managerTarget: ResolvedSwarmManagerTarget,
+	command: string,
+) => {
+	return execOnTarget(managerTarget.target, command);
+};
+
+const parseJsonValue = <T>(stdout: string, fallback: T): T => {
+	const trimmedStdout = stdout.trim();
+	if (!trimmedStdout) {
+		return fallback;
+	}
+
+	try {
+		return JSON.parse(trimmedStdout) as T;
+	} catch {
+		return fallback;
+	}
+};
+
+const extractManagerHost = (address: string) => {
+	const trimmedAddress = address.trim();
+	if (!trimmedAddress) {
+		return "";
+	}
+
+	if (trimmedAddress.startsWith("[")) {
+		const endBracketIndex = trimmedAddress.indexOf("]");
+		if (endBracketIndex > 1) {
+			return trimmedAddress.slice(1, endBracketIndex);
+		}
+	}
+
+	const colonCount = (trimmedAddress.match(/:/g) || []).length;
+	if (colonCount === 1) {
+		return trimmedAddress.split(":")[0] || trimmedAddress;
+	}
+
+	return trimmedAddress;
+};
+
+const getServerSshConnection = (server: {
+	ipAddress: string;
+	port: number;
+	username: string;
+	sshKey?: {
+		privateKey: string;
+	} | null;
+}) => {
+	const privateKey = server.sshKey?.privateKey;
+	if (!privateKey) {
+		return null;
+	}
+
+	return {
+		host: server.ipAddress,
+		port: server.port,
+		username: server.username,
+		privateKey,
+	} satisfies SshConnectionConfig;
+};
+
+const isSwarmManagerTarget = async (target: CommandExecutionTarget) => {
+	try {
+		const { stdout } = await execOnTarget(
+			target,
+			"docker info --format '{{json .Swarm.ControlAvailable}}'",
+		);
+
+		return parseJsonValue<boolean>(stdout, false);
+	} catch {
+		return false;
+	}
+};
+
+const getSwarmRemoteManagers = async (target: CommandExecutionTarget) => {
+	try {
+		const { stdout } = await execOnTarget(
+			target,
+			"docker info --format '{{json .Swarm.RemoteManagers}}'",
+		);
+
+		const remoteManagers = parseJsonValue<SwarmRemoteManager[]>(stdout, []);
+		return remoteManagers
+			.map((manager) => extractManagerHost(manager.Addr || ""))
+			.filter(Boolean);
+	} catch {
+		return [] as string[];
+	}
+};
+
+const uniqueHosts = (hosts: string[]) => {
+	return [...new Set(hosts.map((host) => host.trim()).filter(Boolean))];
+};
+
+const resolveManagerFromHosts = async ({
+	hosts,
+	organizationId,
+	sshFallbackConnection,
+}: {
+	hosts: string[];
+	organizationId?: string;
+	sshFallbackConnection?: SshConnectionConfig;
+}) => {
+	for (const host of hosts) {
+		const matchedServer = organizationId
+			? await findServerByIpAddress(host, organizationId)
+			: await findServerByIpAddress(host);
+
+		if (matchedServer) {
+			const target = {
+				type: "server",
+				serverId: matchedServer.serverId,
+			} satisfies CommandExecutionTarget;
+
+			if (await isSwarmManagerTarget(target)) {
+				return {
+					target,
+					serverId: matchedServer.serverId,
+					organizationId,
+					sshFallbackConnection:
+						getServerSshConnection(matchedServer) || sshFallbackConnection,
+				} satisfies ResolvedSwarmManagerTarget;
+			}
+		}
+	}
+
+	if (sshFallbackConnection?.privateKey) {
+		for (const host of hosts) {
+			const target = {
+				type: "ssh",
+				connection: {
+					...sshFallbackConnection,
+					host,
+				},
+			} satisfies CommandExecutionTarget;
+
+			if (await isSwarmManagerTarget(target)) {
+				return {
+					target,
+					serverId: null,
+					organizationId,
+					sshFallbackConnection,
+				} satisfies ResolvedSwarmManagerTarget;
+			}
+		}
+	}
+
+	return null;
+};
+
+export const resolveSwarmManagerExecutionTarget = async (
+	managerServerId?: string | null,
+	organizationId?: string,
+) => {
+	let resolvedOrganizationId = organizationId;
+
+	if (managerServerId) {
+		const configuredServer = await findServerById(managerServerId);
+		resolvedOrganizationId =
+			resolvedOrganizationId || configuredServer.organizationId;
+
+		const configuredTarget = {
+			type: "server",
+			serverId: managerServerId,
+		} satisfies CommandExecutionTarget;
+		const configuredSshConnection = getServerSshConnection(configuredServer);
+
+		if (await isSwarmManagerTarget(configuredTarget)) {
+			return {
+				target: configuredTarget,
+				serverId: managerServerId,
+				organizationId: resolvedOrganizationId,
+				sshFallbackConnection: configuredSshConnection || undefined,
+			} satisfies ResolvedSwarmManagerTarget;
+		}
+
+		const managerHosts = uniqueHosts(
+			await getSwarmRemoteManagers(configuredTarget),
+		);
+
+		const resolvedManager = await resolveManagerFromHosts({
+			hosts: managerHosts,
+			organizationId: resolvedOrganizationId,
+			sshFallbackConnection: configuredSshConnection || undefined,
+		});
+
+		if (resolvedManager) {
+			return resolvedManager;
+		}
+
+		throw new Error(
+			`Server ${configuredServer.name} (${configuredServer.ipAddress}) is a swarm worker and no manager endpoint could be resolved. Add a manager node as a Dokploy server or ensure worker credentials can SSH into at least one manager listed by 'docker info'.`,
+		);
+	}
+
+	const localTarget = {
+		type: "local",
+	} satisfies CommandExecutionTarget;
+
+	if (await isSwarmManagerTarget(localTarget)) {
+		return {
+			target: localTarget,
+			serverId: null,
+			organizationId: resolvedOrganizationId,
+		} satisfies ResolvedSwarmManagerTarget;
+	}
+
+	const managerHosts = uniqueHosts(await getSwarmRemoteManagers(localTarget));
+	const resolvedManager = await resolveManagerFromHosts({
+		hosts: managerHosts,
+		organizationId: resolvedOrganizationId,
+	});
+
+	if (resolvedManager) {
+		return resolvedManager;
+	}
+
+	throw new Error(
+		"This Dokploy instance is running on a swarm worker node. Configure a swarm manager server in Dokploy so swarm control-plane commands can be executed.",
+	);
 };
 
 const parseJsonLines = <T>(stdout: string): T[] => {
@@ -77,14 +318,14 @@ const parseJsonLines = <T>(stdout: string): T[] => {
 
 const inspectTasks = async (
 	taskIds: string[],
-	managerServerId: string | null | undefined,
+	managerTarget: ResolvedSwarmManagerTarget,
 ) => {
 	if (taskIds.length === 0) {
 		return [] as SwarmTaskInspect[];
 	}
 
 	const { stdout } = await execOnManager(
-		managerServerId,
+		managerTarget,
 		`docker inspect ${taskIds.join(" ")} --format '{{json .}}'`,
 	);
 
@@ -93,18 +334,18 @@ const inspectTasks = async (
 
 const inspectTask = async (
 	taskId: string,
-	managerServerId: string | null | undefined,
+	managerTarget: ResolvedSwarmManagerTarget,
 ) => {
-	const tasks = await inspectTasks([taskId], managerServerId);
+	const tasks = await inspectTasks([taskId], managerTarget);
 	return tasks[0] || null;
 };
 
 const inspectNode = async (
 	nodeId: string,
-	managerServerId: string | null | undefined,
+	managerTarget: ResolvedSwarmManagerTarget,
 ) => {
 	const { stdout } = await execOnManager(
-		managerServerId,
+		managerTarget,
 		`docker node inspect ${nodeId} --format '{{json .}}'`,
 	);
 
@@ -116,9 +357,9 @@ const inspectNode = async (
 	return JSON.parse(trimmedStdout) as SwarmNodeInspect;
 };
 
-const getManagerNodeId = async (managerServerId: string | null | undefined) => {
+const getManagerNodeId = async (managerTarget: ResolvedSwarmManagerTarget) => {
 	const { stdout } = await execOnManager(
-		managerServerId,
+		managerTarget,
 		"docker info --format '{{json .Swarm.NodeID}}'",
 	);
 
@@ -132,27 +373,15 @@ const getManagerNodeId = async (managerServerId: string | null | undefined) => {
 
 const resolveNodeExecutionTarget = async (
 	node: SwarmNodeInspect,
-	managerServerId: string | null | undefined,
+	managerTarget: ResolvedSwarmManagerTarget,
 	organizationId?: string,
 ) => {
-	const managerNodeId = await getManagerNodeId(managerServerId);
+	const managerNodeId = await getManagerNodeId(managerTarget);
 	if (managerNodeId && node.ID === managerNodeId) {
-		const resolvedTarget: ResolvedExecutionTarget = managerServerId
-			? {
-					target: {
-						type: "server",
-						serverId: managerServerId,
-					},
-					serverId: managerServerId,
-				}
-			: {
-					target: {
-						type: "local",
-					},
-					serverId: null,
-				};
-
-		return resolvedTarget;
+		return {
+			target: managerTarget.target,
+			serverId: managerTarget.serverId,
+		} satisfies ResolvedExecutionTarget;
 	}
 
 	const nodeAddress = node.Status?.Addr;
@@ -160,13 +389,7 @@ const resolveNodeExecutionTarget = async (
 		throw new Error("Unable to resolve the swarm node address.");
 	}
 
-	let resolvedOrganizationId = organizationId;
-	let managerServer: Awaited<ReturnType<typeof findServerById>> | null = null;
-
-	if (managerServerId) {
-		managerServer = await findServerById(managerServerId);
-		resolvedOrganizationId = managerServer.organizationId;
-	}
+	const resolvedOrganizationId = organizationId || managerTarget.organizationId;
 
 	const matchedServer = resolvedOrganizationId
 		? await findServerByIpAddress(nodeAddress, resolvedOrganizationId)
@@ -182,15 +405,15 @@ const resolveNodeExecutionTarget = async (
 		} satisfies ResolvedExecutionTarget;
 	}
 
-	if (managerServer?.sshKey?.privateKey) {
+	if (managerTarget.sshFallbackConnection?.privateKey) {
 		return {
 			target: {
 				type: "ssh",
 				connection: {
 					host: nodeAddress,
-					port: managerServer.port,
-					username: managerServer.username,
-					privateKey: managerServer.sshKey.privateKey,
+					port: managerTarget.sshFallbackConnection.port,
+					username: managerTarget.sshFallbackConnection.username,
+					privateKey: managerTarget.sshFallbackConnection.privateKey,
 				},
 			},
 			serverId: null,
@@ -200,7 +423,7 @@ const resolveNodeExecutionTarget = async (
 	throw new Error(
 		`Unable to connect to swarm node ${
 			node.Description?.Hostname || nodeAddress
-		} (${nodeAddress}). Add this node as a Dokploy server or make sure it uses the same SSH credentials as the manager node.`,
+		} (${nodeAddress}). Add this node as a Dokploy server or make sure manager credentials can SSH to this node.`,
 	);
 };
 
@@ -221,7 +444,7 @@ const getRecentTask = (tasks: SwarmTaskInspect[]) => {
 
 const resolveNodeTarget = async (
 	task: SwarmTaskInspect,
-	managerServerId: string | null | undefined,
+	managerTarget: ResolvedSwarmManagerTarget,
 	organizationId?: string,
 ) => {
 	const nodeId = task.NodeID;
@@ -230,14 +453,14 @@ const resolveNodeTarget = async (
 		throw new Error("The selected swarm task is not assigned to any node.");
 	}
 
-	const node = await inspectNode(nodeId, managerServerId);
+	const node = await inspectNode(nodeId, managerTarget);
 	if (!node) {
 		throw new Error(`Unable to inspect swarm node ${nodeId}.`);
 	}
 
 	const executionTarget = await resolveNodeExecutionTarget(
 		node,
-		managerServerId,
+		managerTarget,
 		organizationId,
 	);
 
@@ -253,7 +476,7 @@ const resolveNodeTarget = async (
 
 const resolveTaskTarget = async (
 	task: SwarmTaskInspect,
-	managerServerId: string | null | undefined,
+	managerTarget: ResolvedSwarmManagerTarget,
 	organizationId?: string,
 ) => {
 	const containerId = task.Status?.ContainerStatus?.ContainerID;
@@ -264,7 +487,7 @@ const resolveTaskTarget = async (
 
 	const nodeTarget = await resolveNodeTarget(
 		task,
-		managerServerId,
+		managerTarget,
 		organizationId,
 	);
 
@@ -280,12 +503,17 @@ export const resolveSwarmTaskExecutionTarget = async (
 	managerServerId?: string | null,
 	organizationId?: string,
 ) => {
-	const task = await inspectTask(taskId, managerServerId);
+	const managerTarget = await resolveSwarmManagerExecutionTarget(
+		managerServerId,
+		organizationId,
+	);
+	const resolvedOrganizationId = organizationId || managerTarget.organizationId;
+	const task = await inspectTask(taskId, managerTarget);
 	if (!task) {
 		throw new Error(`Swarm task ${taskId} was not found.`);
 	}
 
-	return resolveTaskTarget(task, managerServerId, organizationId);
+	return resolveTaskTarget(task, managerTarget, resolvedOrganizationId);
 };
 
 export const resolveSwarmServiceExecutionTarget = async (
@@ -293,8 +521,14 @@ export const resolveSwarmServiceExecutionTarget = async (
 	managerServerId?: string | null,
 	organizationId?: string,
 ) => {
-	const { stdout } = await execOnManager(
+	const managerTarget = await resolveSwarmManagerExecutionTarget(
 		managerServerId,
+		organizationId,
+	);
+	const resolvedOrganizationId = organizationId || managerTarget.organizationId;
+
+	const { stdout } = await execOnManager(
+		managerTarget,
 		`docker service ps "${serviceName}" --filter desired-state=running --no-trunc -q`,
 	);
 
@@ -307,7 +541,7 @@ export const resolveSwarmServiceExecutionTarget = async (
 		throw new Error(`No running task found for swarm service ${serviceName}.`);
 	}
 
-	const tasks = await inspectTasks(taskIds, managerServerId);
+	const tasks = await inspectTasks(taskIds, managerTarget);
 	const runningTask = getRunningTask(tasks);
 
 	if (!runningTask) {
@@ -316,7 +550,7 @@ export const resolveSwarmServiceExecutionTarget = async (
 		);
 	}
 
-	return resolveTaskTarget(runningTask, managerServerId, organizationId);
+	return resolveTaskTarget(runningTask, managerTarget, resolvedOrganizationId);
 };
 
 export const resolveSwarmServiceNodeExecutionTarget = async (
@@ -324,8 +558,14 @@ export const resolveSwarmServiceNodeExecutionTarget = async (
 	managerServerId?: string | null,
 	organizationId?: string,
 ) => {
-	const { stdout } = await execOnManager(
+	const managerTarget = await resolveSwarmManagerExecutionTarget(
 		managerServerId,
+		organizationId,
+	);
+	const resolvedOrganizationId = organizationId || managerTarget.organizationId;
+
+	const { stdout } = await execOnManager(
+		managerTarget,
 		`docker service ps "${serviceName}" --no-trunc -q`,
 	);
 
@@ -338,7 +578,7 @@ export const resolveSwarmServiceNodeExecutionTarget = async (
 		throw new Error(`No task found for swarm service ${serviceName}.`);
 	}
 
-	const tasks = await inspectTasks(taskIds, managerServerId);
+	const tasks = await inspectTasks(taskIds, managerTarget);
 	const task = getRunningTask(tasks) || getRecentTask(tasks);
 
 	if (!task) {
@@ -347,5 +587,5 @@ export const resolveSwarmServiceNodeExecutionTarget = async (
 		);
 	}
 
-	return resolveNodeTarget(task, managerServerId, organizationId);
+	return resolveNodeTarget(task, managerTarget, resolvedOrganizationId);
 };

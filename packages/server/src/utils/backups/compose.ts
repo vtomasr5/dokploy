@@ -2,6 +2,7 @@ import type { BackupSchedule } from "@dokploy/server/services/backup";
 import type { Compose } from "@dokploy/server/services/compose";
 import {
 	createDeploymentBackup,
+	updateDeployment,
 	updateDeploymentStatus,
 } from "@dokploy/server/services/deployment";
 import { findEnvironmentById } from "@dokploy/server/services/environment";
@@ -12,6 +13,7 @@ import {
 	execAsyncOnTarget,
 } from "../process/execAsync";
 import {
+	appendDeploymentLog,
 	prepareDeploymentLogOnTarget,
 	syncDeploymentLogFromTarget,
 } from "../swarm/deployment-log";
@@ -121,6 +123,9 @@ export const runComposeBackup = async (
 
 		await updateDeploymentStatus(deployment.deploymentId, "done");
 	} catch (error) {
+		const errorMessage =
+			error instanceof Error ? error.message : "Error message not provided";
+
 		if (swarmTarget?.target.type === "ssh" && !swarmTarget.serverId) {
 			await syncDeploymentLogFromTarget({
 				sourceLogPath: deployment.logPath,
@@ -130,14 +135,23 @@ export const runComposeBackup = async (
 			}).catch(() => undefined);
 		}
 
+		await appendDeploymentLog({
+			logPath: deployment.logPath,
+			target: managerTarget,
+			message: `\n❌ ${errorMessage}\n`,
+		}).catch(() => undefined);
+
+		await updateDeployment(deployment.deploymentId, {
+			errorMessage,
+		}).catch(() => undefined);
+
 		console.log(error);
 		await sendDatabaseBackupNotifications({
 			applicationName: name,
 			projectName: project.name,
 			databaseType: getDatabaseType(databaseType),
 			type: "error",
-			// @ts-ignore
-			errorMessage: error?.message || "Error message not provided",
+			errorMessage,
 			organizationId: project.organizationId,
 			databaseName: backup.database,
 		});

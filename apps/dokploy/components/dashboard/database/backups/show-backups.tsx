@@ -314,10 +314,12 @@ export const ShowBackups = ({
 																						"Manual Backup Successful",
 																					);
 																				})
-																				.catch(() => {
-																					toast.error(
-																						"Error creating the manual backup",
-																					);
+																				.catch((error) => {
+																					const message =
+																						error instanceof Error
+																							? error.message
+																							: "Error creating the manual backup";
+																					toast.error(message);
 																				});
 																			setActiveManualBackup(undefined);
 																		}}

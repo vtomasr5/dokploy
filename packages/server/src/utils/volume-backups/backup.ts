@@ -5,11 +5,10 @@ import type { findVolumeBackupById } from "@dokploy/server/services/volume-backu
 import { getS3Credentials, normalizeS3Path } from "../backups/utils";
 import {
 	type CommandExecutionTarget,
-	execAsync,
 	execAsyncOnTarget,
-	execAsyncRemote,
 } from "../process/execAsync";
 import {
+	resolveSwarmManagerExecutionTarget,
 	resolveSwarmServiceExecutionTarget,
 	resolveSwarmServiceNodeExecutionTarget,
 } from "../swarm/service-target";
@@ -62,6 +61,26 @@ export const getVolumeServiceAppName = (
 	return serviceAppName || volumeBackup.appName;
 };
 
+const getVolumeBackupOrganizationId = (volumeBackup: VolumeBackupRecord) => {
+	const services = [
+		volumeBackup.application,
+		volumeBackup.compose,
+		volumeBackup.postgres,
+		volumeBackup.mysql,
+		volumeBackup.mariadb,
+		volumeBackup.mongo,
+		volumeBackup.redis,
+	];
+
+	for (const service of services) {
+		if (service?.environment?.project?.organizationId) {
+			return service.environment.project.organizationId;
+		}
+	}
+
+	return undefined;
+};
+
 export const getVolumeManagerTarget = (serverId: string | null) => {
 	if (serverId) {
 		return {
@@ -78,46 +97,74 @@ export const getVolumeManagerTarget = (serverId: string | null) => {
 const resolveSwarmVolumeTarget = async (
 	volumeBackup: VolumeBackupRecord,
 	serverId: string | null,
+	organizationId?: string,
 ) => {
+	const managerContext = await resolveSwarmManagerExecutionTarget(
+		serverId,
+		organizationId,
+	);
 	const swarmTarget = await resolveSwarmServiceExecutionTarget(
 		getVolumeServiceAppName(volumeBackup),
 		serverId,
+		organizationId,
 	);
 
 	return {
+		managerTarget: managerContext.target,
+		managerServerId: managerContext.serverId,
 		dataTarget: swarmTarget.target,
 		dataServerId: swarmTarget.serverId,
 		composeType: undefined,
 	} satisfies Pick<
 		VolumeBackupExecutionContext,
-		"dataTarget" | "dataServerId" | "composeType"
+		| "managerTarget"
+		| "managerServerId"
+		| "dataTarget"
+		| "dataServerId"
+		| "composeType"
 	>;
 };
 
 const resolveComposeVolumeTarget = async (
 	volumeBackup: VolumeBackupRecord,
 	serverId: string | null,
+	organizationId?: string,
 ) => {
 	const compose = await findComposeById(volumeBackup.compose?.composeId || "");
 
 	if (compose.composeType === "stack") {
-		const swarmTarget = await resolveSwarmVolumeTarget(volumeBackup, serverId);
+		const swarmTarget = await resolveSwarmVolumeTarget(
+			volumeBackup,
+			serverId,
+			organizationId,
+		);
 		return {
 			...swarmTarget,
 			composeType: compose.composeType,
 		} satisfies Pick<
 			VolumeBackupExecutionContext,
-			"dataTarget" | "dataServerId" | "composeType"
+			| "managerTarget"
+			| "managerServerId"
+			| "dataTarget"
+			| "dataServerId"
+			| "composeType"
 		>;
 	}
 
+	const managerTarget = getVolumeManagerTarget(serverId);
 	return {
+		managerTarget,
+		managerServerId: serverId,
 		dataTarget: getVolumeManagerTarget(serverId),
 		dataServerId: serverId,
 		composeType: compose.composeType,
 	} satisfies Pick<
 		VolumeBackupExecutionContext,
-		"dataTarget" | "dataServerId" | "composeType"
+		| "managerTarget"
+		| "managerServerId"
+		| "dataTarget"
+		| "dataServerId"
+		| "composeType"
 	>;
 };
 
@@ -125,6 +172,7 @@ export const resolveVolumeBackupExecutionContext = async (
 	volumeBackup: VolumeBackupRecord,
 ) => {
 	const serverId = getVolumeBackupServerId(volumeBackup);
+	const organizationId = getVolumeBackupOrganizationId(volumeBackup);
 	const { VOLUME_BACKUPS_PATH, VOLUME_BACKUP_LOCK_PATH } = paths(!!serverId);
 	const destination = volumeBackup.destination;
 	const s3AppName = getVolumeServiceAppName(volumeBackup);
@@ -135,16 +183,15 @@ export const resolveVolumeBackupExecutionContext = async (
 	const volumeBackupPath = path.join(VOLUME_BACKUPS_PATH, volumeBackup.appName);
 	const serviceName = getVolumeServiceAppName(volumeBackup);
 	const lockPath = `${VOLUME_BACKUP_LOCK_PATH}-${serviceName}`;
-	const managerTarget = getVolumeManagerTarget(serverId);
 
 	const targetInfo =
 		volumeBackup.serviceType === "compose"
-			? await resolveComposeVolumeTarget(volumeBackup, serverId)
-			: await resolveSwarmVolumeTarget(volumeBackup, serverId);
+			? await resolveComposeVolumeTarget(volumeBackup, serverId, organizationId)
+			: await resolveSwarmVolumeTarget(volumeBackup, serverId, organizationId);
 
 	return {
-		managerServerId: serverId,
-		managerTarget,
+		managerServerId: targetInfo.managerServerId,
+		managerTarget: targetInfo.managerTarget,
 		dataTarget: targetInfo.dataTarget,
 		dataServerId: targetInfo.dataServerId,
 		lockPath,
@@ -208,12 +255,23 @@ export const resolveComposeStackVolumeNodeTarget = async (
 	stackName: string,
 	volumeName: string,
 	managerServerId?: string | null,
+	organizationId?: string,
 ) => {
-	const serviceNames = await listStackServiceNames(stackName, managerServerId);
+	const managerContext = await resolveSwarmManagerExecutionTarget(
+		managerServerId,
+		organizationId,
+	);
+	const serviceNames = await listStackServiceNames(
+		stackName,
+		managerContext.target,
+	);
 	const matchingServices: string[] = [];
 
 	for (const serviceName of serviceNames) {
-		const mounts = await inspectServiceMounts(serviceName, managerServerId);
+		const mounts = await inspectServiceMounts(
+			serviceName,
+			managerContext.target,
+		);
 		const hasVolume = mounts.some(
 			(mount) => mount.Type === "volume" && mount.Source === volumeName,
 		);
@@ -233,6 +291,7 @@ export const resolveComposeStackVolumeNodeTarget = async (
 		return resolveSwarmServiceNodeExecutionTarget(
 			matchingServices[0],
 			managerServerId,
+			organizationId,
 		);
 	}
 
@@ -248,12 +307,14 @@ interface ServiceMount {
 
 const listStackServiceNames = async (
 	stackName: string,
-	managerServerId?: string | null,
+	managerTarget: CommandExecutionTarget,
 ) => {
 	const command = `docker stack services "${stackName}" --format '{{.Name}}'`;
-	const result = managerServerId
-		? await execAsyncRemote(managerServerId, command)
-		: await execAsync(command);
+	const result = await execAsyncOnTarget(managerTarget, command, {
+		localOptions: {
+			shell: "/bin/bash",
+		},
+	});
 
 	return result.stdout
 		.split("\n")
@@ -263,12 +324,14 @@ const listStackServiceNames = async (
 
 const inspectServiceMounts = async (
 	serviceName: string,
-	managerServerId?: string | null,
+	managerTarget: CommandExecutionTarget,
 ) => {
 	const command = `docker service inspect "${serviceName}" --format '{{json .Spec.TaskTemplate.ContainerSpec.Mounts}}'`;
-	const result = managerServerId
-		? await execAsyncRemote(managerServerId, command)
-		: await execAsync(command);
+	const result = await execAsyncOnTarget(managerTarget, command, {
+		localOptions: {
+			shell: "/bin/bash",
+		},
+	});
 
 	const trimmedStdout = result.stdout.trim();
 	if (!trimmedStdout || trimmedStdout === "null") {
