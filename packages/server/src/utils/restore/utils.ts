@@ -102,6 +102,7 @@ interface RestoreOptions {
 	serviceName?: string;
 	rcloneCommand: string;
 	backupFile?: string;
+	containerId?: string;
 }
 
 export const getRestoreCommand = ({
@@ -112,6 +113,7 @@ export const getRestoreCommand = ({
 	serviceName,
 	rcloneCommand,
 	backupFile,
+	containerId,
 }: RestoreOptions) => {
 	const containerSearch = getComposeSearchCommand(
 		appName,
@@ -119,7 +121,9 @@ export const getRestoreCommand = ({
 		serviceName,
 	);
 	const restoreCommand = generateRestoreCommand(type, credentials);
-	let cmd = `CONTAINER_ID=$(${containerSearch})`;
+	let cmd = containerId
+		? `CONTAINER_ID="${containerId}"`
+		: `CONTAINER_ID=$(${containerSearch})`;
 
 	if (type !== "mongo") {
 		cmd += ` && ${rcloneCommand} | ${restoreCommand}`;

@@ -3,7 +3,8 @@ import type { Destination } from "@dokploy/server/services/destination";
 import type { Postgres } from "@dokploy/server/services/postgres";
 import type { z } from "zod";
 import { getS3Credentials } from "../backups/utils";
-import { execAsync, execAsyncRemote } from "../process/execAsync";
+import { execAsyncOnTarget } from "../process/execAsync";
+import { resolveSwarmServiceExecutionTarget } from "../swarm/service-target";
 import { getRestoreCommand } from "./utils";
 
 export const restorePostgresBackup = async (
@@ -21,6 +22,7 @@ export const restorePostgresBackup = async (
 		const backupPath = `${bucketPath}/${backupInput.backupFile}`;
 
 		const rcloneCommand = `rclone cat ${rcloneFlags.join(" ")} "${backupPath}" | gunzip`;
+		const target = await resolveSwarmServiceExecutionTarget(appName, serverId);
 
 		emit("Starting restore...");
 		emit(`Backup path: ${backupPath}`);
@@ -34,15 +36,16 @@ export const restorePostgresBackup = async (
 			type: "postgres",
 			rcloneCommand,
 			restoreType: "database",
+			containerId: target.containerId,
 		});
 
 		emit(`Executing command: ${command}`);
 
-		if (serverId) {
-			await execAsyncRemote(serverId, command);
-		} else {
-			await execAsync(command);
-		}
+		await execAsyncOnTarget(target.target, command, {
+			localOptions: {
+				shell: "/bin/bash",
+			},
+		});
 
 		emit("Restore completed successfully!");
 	} catch (error) {

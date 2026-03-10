@@ -15,10 +15,7 @@ import {
 	updateVolumeBackupSchema,
 	volumeBackups,
 } from "@dokploy/server/db/schema";
-import {
-	execAsyncRemote,
-	execAsyncStream,
-} from "@dokploy/server/utils/process/execAsync";
+import { execAsyncStreamOnTarget } from "@dokploy/server/utils/process/execAsync";
 import { TRPCError } from "@trpc/server";
 import { observable } from "@trpc/server/observable";
 import { desc, eq } from "drizzle-orm";
@@ -173,12 +170,11 @@ export const volumeBackupsRouter = createTRPCRouter({
 						emit.next(""); // Empty line for better readability
 
 						// Generate the restore command
-						const restoreCommand = await restoreVolume(
+						const restorePlan = await restoreVolume(
 							input.id,
 							input.destinationId,
 							input.volumeName,
 							input.backupFileName,
-							input.serverId || "",
 							input.serviceType,
 						);
 
@@ -187,17 +183,23 @@ export const volumeBackupsRouter = createTRPCRouter({
 						emit.next(""); // Empty line
 
 						// Execute the restore command with real-time output
-						if (input.serverId) {
-							emit.next(`🌐 Executing on remote server: ${input.serverId}`);
-							await execAsyncRemote(input.serverId, restoreCommand, (data) => {
-								emit.next(data);
-							});
-						} else {
-							emit.next("🖥️ Executing on local server");
-							await execAsyncStream(restoreCommand, (data) => {
-								emit.next(data);
-							});
-						}
+						emit.next(
+							restorePlan.target.type === "local"
+								? "🖥️ Executing on local server"
+								: "🌐 Executing on the swarm node hosting this volume",
+						);
+						await execAsyncStreamOnTarget(
+							restorePlan.target,
+							restorePlan.command,
+							{
+								onData: (data) => {
+									emit.next(data);
+								},
+								localOptions: {
+									shell: "/bin/bash",
+								},
+							},
+						);
 
 						emit.next("");
 						emit.next("✅ Volume restore completed successfully!");

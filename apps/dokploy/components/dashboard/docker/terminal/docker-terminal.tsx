@@ -10,12 +10,14 @@ interface Props {
 	id: string;
 	containerId?: string;
 	serverId?: string;
+	runType?: "native" | "swarm";
 }
 
 export const DockerTerminal: React.FC<Props> = ({
 	id,
 	containerId,
 	serverId,
+	runType = "native",
 }) => {
 	const termRef = useRef(null);
 	const [activeWay, setActiveWay] = React.useState<string | undefined>("bash");
@@ -38,7 +40,7 @@ export const DockerTerminal: React.FC<Props> = ({
 		const addonFit = new FitAddon();
 		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 
-		const wsUrl = `${protocol}//${window.location.host}/docker-container-terminal?containerId=${containerId}&activeWay=${activeWay}${serverId ? `&serverId=${serverId}` : ""}`;
+		const wsUrl = `${protocol}//${window.location.host}/docker-container-terminal?containerId=${containerId}&activeWay=${activeWay}&runType=${runType}${serverId ? `&serverId=${serverId}` : ""}`;
 
 		const ws = new WebSocket(wsUrl);
 
@@ -52,7 +54,7 @@ export const DockerTerminal: React.FC<Props> = ({
 		return () => {
 			ws.readyState === WebSocket.OPEN && ws.close();
 		};
-	}, [containerId, activeWay, id]);
+	}, [containerId, activeWay, id, runType, serverId]);
 
 	return (
 		<div className="flex flex-col gap-4">

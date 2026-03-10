@@ -119,6 +119,8 @@ export * from "./utils/schedules/index";
 export * from "./utils/schedules/utils";
 export * from "./utils/servers/remote-docker";
 export * from "./utils/startup/cancell-deployments";
+export * from "./utils/swarm/deployment-log";
+export * from "./utils/swarm/service-target";
 export * from "./utils/tracking/hubspot";
 export * from "./utils/traefik/application";
 export * from "./utils/traefik/domain";
